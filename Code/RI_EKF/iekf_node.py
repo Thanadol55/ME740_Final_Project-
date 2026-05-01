@@ -12,7 +12,7 @@ import csv
 from pathlib import Path
 import sys
 
-# from spot_description URDF
+# Spot URDF link lengths.
 SPOT_HIP_LEN  = 0.111
 SPOT_UPPER    = 0.320
 SPOT_LOWER    = 0.370
@@ -21,9 +21,10 @@ SPOT_SHOULDER = 0.297   # body half-length along x
 
 class IEKF_Active(Node):
     """
-    RI-EKF / standard EKF on SE_2(3) for Spot.
-    Ref: Hartley et al. 2020 IJRR (contact-aided IEKF).
-    Autonomous init from IMU gravity. GT subscribed for ATE only.
+    Contact-aided inertial estimator for Spot.
+
+    Runs either RI-EKF or standard EKF on SE_2(3). Ground truth is logged for
+    ATE evaluation only.
     """
 
     def _ask_mode(self):
@@ -66,10 +67,7 @@ class IEKF_Active(Node):
         self.exp_num = str(
             self.declare_parameter('experiment_number', '01').value).strip()
 
-        # config -- matches proposal Table 2
-        #   baseline: VO=False Gate=False
-        #   VO only:  VO=True  Gate=False
-        #   proposed: VO=True  Gate=True
+        # Experiment switches.
         self.ENABLE_VO          = True
         self.ENABLE_IMPACT_GATE = True
 
@@ -83,7 +81,6 @@ class IEKF_Active(Node):
         self.csv_path  = self._out_dir / f'{self.run_name}.csv'
         self.csv_summary_path = self._out_dir / f'{self.run_name}_summary.csv'
 
-        # log for debugging: to see how much the VO is gated 
         self.get_logger().info(
             '%s on SE_2(3) | VO=%s | GATE=%s | topic=%s | out=%s' %
             (self.filt_label, self.ENABLE_VO, self.ENABLE_IMPACT_GATE,
@@ -92,7 +89,7 @@ class IEKF_Active(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                           history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        # subs and publish the value
+        # ROS I/O.
         self.imu_sub   = self.create_subscription(Imu, '/imu/data', self._on_imu, qos)
         self.gt_sub    = self.create_subscription(Odometry, '/ground_truth/odom', self._on_gt, 10)
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self._on_joints, 10)
@@ -108,12 +105,12 @@ class IEKF_Active(Node):
         self.ba = np.zeros(3)
         self._initialized = False
 
-        # 15x15 error-state cov
+        # Error-state covariance.
         self.P = np.eye(15) * 0.01
         self.P[9:12, 9:12]   = np.eye(3) * 1e-4
         self.P[12:15, 12:15] = np.eye(3) * 1e-6  # keep tight -- ba ate ~g when this was 1e-2
 
-        # IMU noise (continuous-time, tuned for Spot IMU in Isaac Sim 2023.1)
+        # Continuous-time IMU noise, tuned for the Spot IMU in Isaac Sim 2023.1.
         self.ng  = 0.02    # gyro [rad/s/sqrt(Hz)]
         self.na  = 0.10    # accel
         self.nbg = 1e-4    # gyro bias rw
@@ -122,26 +119,25 @@ class IEKF_Active(Node):
         self.gravity = np.array([0., 0., -9.81])
         self._last_t = None
 
-        # leg kinematics
+        # Leg kinematics.
         self.LEG_IDS = ['fl', 'fr', 'hl', 'hr']
         self.last_fp   = {k: np.zeros(3) for k in self.LEG_IDS}
         self.foot_vels = {k: np.zeros(3) for k in self.LEG_IDS}
         self._jnt_t = None
 
-        # slip calibration -- tuned on flat-ground Isaac Sim runs
-        # This is still hand-tune, need a solid estimation 
-        # lateral sway from trot was creating a steady Y drift
+        # Slip calibration from flat-ground Isaac Sim runs.
+        # Still hand-tuned; lateral trot sway was producing steady Y drift.
         self.kx = 1.0
         self.ky = 0.20    # tried 0.3 and 0.1, settled on 0.2
         self.stopped_thr = 0.05
 
-        # gait phase tracking
+        # Gait phase tracking.
         self.phi_gait = {'fl': 0.0, 'fr': 0.5, 'hl': 0.5, 'hr': 0.0}
         self.dc     = 0.55   # must match natural_gait.py duty_cycle
         self.f_gait = 2.0
         self._got_phase = False
 
-        # VO fusion params
+        # VO heading fusion.
         self.R_vo_base     = np.array([[0.01]])
         self.vo_quality_k  = 6.5
         self.vo_impact_scale = 25.0
@@ -152,16 +148,16 @@ class IEKF_Active(Node):
         self._has_vo  = False
         self._imu_ready = False
 
-        # measurement noise (vx vy vz height)
+        # Measurement noise: vx, vy, vz, height.
         self.Rn_stance  = np.diag([0.12, 0.20, 0.07, 0.02])
         self.Rn_swing   = np.diag([100., 200., 0.1,  0.01])
         self.Rn_stopped = np.diag([0.0017, 0.0017, 0.0017, 0.005])
 
-        # GT for offline ATE eval -- never fed to filter
+        # Ground truth is logged only for offline ATE evaluation.
         self.gt_pos  = np.zeros(3)
         self.gt_quat = [0., 0., 0., 1.]
 
-        # logging
+        # Run logs.
         self.tlog = []
         self.gt_x, self.gt_y = [], []
         self.est_x, self.est_y = [], []
@@ -183,7 +179,7 @@ class IEKF_Active(Node):
         self._cur_vo     = 'vo_wait'
 
 
-    # Math Method used in RI-EKF
+    # Math helpers.
 
     def _skew(self, v):
         return np.array([[0, -v[2], v[1]],
@@ -191,7 +187,7 @@ class IEKF_Active(Node):
                          [-v[1], v[0], 0]])
 
     def _exp_so3(self, phi):
-        # rodrigues -- see eq.6 in Hartley
+        # Rodrigues formula.
         th = np.linalg.norm(phi)
         if th < 1e-10:
             return np.eye(3) + self._skew(phi)
@@ -199,7 +195,7 @@ class IEKF_Active(Node):
         return np.eye(3) + (np.sin(th)/th)*K + ((1-np.cos(th))/(th*th))*K2
 
     def _J_left(self, phi):
-        # Gamma_1 (left Jacobian SO(3))
+        # SO(3) left Jacobian.
         th = np.linalg.norm(phi)
         if th < 1e-10:
             return np.eye(3) + 0.5*self._skew(phi)
@@ -214,7 +210,7 @@ class IEKF_Active(Node):
         return 0.5*np.eye(3) + ((th-np.sin(th))/(th2*th))*K + ((1-th2/2-np.cos(th))/(th2*th2))*K2
 
     def _Ad_SE23(self, X):
-        # 9x9 adjoint -- not used in propagation right now but kept for reference
+        # 9x9 adjoint; kept for reference.
         R = X[:3,:3]; v = X[:3,3]; p = X[:3,4]
         Ad = np.zeros((9,9))
         Ad[:3,:3] = R
@@ -222,7 +218,7 @@ class IEKF_Active(Node):
         Ad[6:9,:3] = self._skew(p) @ R;  Ad[6:9,6:9] = R
         return Ad
 
-    # state shortcut
+    # State accessors.
     def _getR(self):  return self.X[:3,:3]
     def _getv(self):  return self.X[:3, 3]
     def _getp(self):  return self.X[:3, 4]
@@ -231,7 +227,7 @@ class IEKF_Active(Node):
     def _setp(self, p): self.X[:3, 4] = p
 
 
-    # Forward Kinematics
+    # Forward kinematics.
 
     def _get_joint(self, msg, jname):
         try:
@@ -250,9 +246,7 @@ class IEKF_Active(Node):
         return np.array([x, y, z])
 
 
-    # ROS callbacks
-
-    # gait_phase 
+    # ROS callbacks.
     def _on_phase(self, msg):
         if len(msg.data) >= 6:
             self.phi_gait['fl'] = msg.data[0]
@@ -289,7 +283,6 @@ class IEKF_Active(Node):
         self._has_vo = True
 
 
-    # Joint data
     def _on_joints(self, msg):
         tnow = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
@@ -321,10 +314,8 @@ class IEKF_Active(Node):
                 self.foot_vels[leg] = (newpos - self.last_fp[leg]) / dtj
                 self.last_fp[leg] = newpos
 
-    # Ground truth -- internal tracking acting like MOCAP 
-    # Use as a baseline evaluation 
+    # Ground truth is not fused into the filter.
     def _on_gt(self, msg):
-        # offline ATE only
         p = msg.pose.pose.position
         self.gt_pos = np.array([p.x, p.y, p.z])
         o = msg.pose.pose.orientation
@@ -362,7 +353,7 @@ class IEKF_Active(Node):
         return True
 
 
-    # prediction (see sec.IV-B in Hartley et al.) 
+    # Prediction.
 
     def _predict(self, w_raw, a_raw, dt):
         w = w_raw - self.bg
@@ -383,9 +374,9 @@ class IEKF_Active(Node):
         self._setp(p_prev + v_prev*dt + R_prev @ G2 @ a * dt*dt
                    + 0.5*self.gravity*dt*dt)
 
-        # covariance
+        # Covariance propagation.
         if self.is_iekf:
-            # the nice IEKF property: Ac only depends on g (const) and R (slow)
+            # RI-EKF Ac depends mainly on gravity and attitude.
             Ac = np.zeros((15,15))
             Ac[0:3, 9:12]  = -R_prev
             Ac[3:6, 0:3]   = self._skew(self.gravity)
@@ -398,11 +389,10 @@ class IEKF_Active(Node):
             Qc[3:6,3:6]     = self.na**2  * np.eye(3)
             Qc[9:12,9:12]   = self.nbg**2 * np.eye(3)
             Qc[12:15,12:15] = self.nba**2 * np.eye(3)
-            # skipping Ad_X rotation of Q -- large p amplifies cross-terms
-            # and creates positive feedback. direct discretization is fine in sim.
+            # Avoid Ad_X rotation here; large p amplified cross-terms in sim.
             Qd = F @ Qc @ F.T * dt
         else:
-            # standard EKF -- Ac depends on omega and specific force too
+            # Standard EKF includes omega and specific force in Ac.
             Ac = np.zeros((15,15))
             Ac[0:3,0:3]   = -self._skew(w)
             Ac[0:3,9:12]  = -np.eye(3)
@@ -429,7 +419,6 @@ class IEKF_Active(Node):
 
 
     def _check_touchdown(self):
-        # any leg near the stance->swing boundary?
         if not self._got_phase:
             return False
         for leg in self.LEG_IDS:
@@ -442,7 +431,7 @@ class IEKF_Active(Node):
         return self.ENABLE_IMPACT_GATE and self._check_touchdown()
 
 
-    # VO heading fusion 
+    # VO heading fusion.
 
     def _compute_vo_var(self, qscore, fevar, in_impact):
         qscore = float(np.clip(qscore, 0.05, 1.0))
@@ -491,7 +480,7 @@ class IEKF_Active(Node):
                 (tag.upper(), z[0], np.degrees(dyaw), qscore, yvar))
 
 
-    # measurement update
+    # Measurement update.
 
     def _kalman_update(self, z, H, Rn, t, tag):
         S = H @ self.P @ H.T + Rn
@@ -542,7 +531,7 @@ class IEKF_Active(Node):
             self.get_logger().error('NaN/Inf detected in state!')
 
 
-    #  main IMU loop 
+    # Main IMU loop.
 
     def _on_imu(self, msg):
         acc = np.array([msg.linear_acceleration.x,
@@ -553,7 +542,7 @@ class IEKF_Active(Node):
                         msg.angular_velocity.z])
 
         if not self._initialized:
-            # wait until we have at least one FK reading
+            # Wait for at least one FK reading.
             if not np.all(self.last_fp['fl'] == 0):
                 self._init_gravity(acc)
             return
@@ -580,7 +569,6 @@ class IEKF_Active(Node):
         H = np.zeros((4,15))
 
         if maxspd < self.stopped_thr:
-            # robot is stopped
             z[0:3] = -self._getv()
             H[0:3, 3:6] = np.eye(3)
 
@@ -609,18 +597,18 @@ class IEKF_Active(Node):
             self._publish(msg.header.stamp)
             return
 
-        #  stance detection via gait phase 
+        # Stance detection from gait phase.
         self._cur_vo = 'vo_hold' if self._has_vo else 'vo_wait'
         stance = []
         if self._got_phase:
             stance = [l for l in self.LEG_IDS if self.phi_gait[l] < self.dc]
-            # trot gait -> max 2 stance legs at once
+            # Trot gait: at most two stance legs.
             if len(stance) > 2:
                 stance = sorted(stance,
                     key=lambda l: self.dc - self.phi_gait[l],
                     reverse=True)[:2]
 
-        # fallback: two slowest legs
+        # Fallback: use the two slowest legs.
         if not stance:
             spd_map = {l: np.linalg.norm(self.foot_vels[l]) for l in self.LEG_IDS}
             ordered = sorted(self.LEG_IDS, key=lambda l: spd_map[l])
@@ -637,7 +625,7 @@ class IEKF_Active(Node):
         nst = len(stance)
         sum_fv /= nst;  sum_fp /= nst
 
-        # leg disagreement as slip indicator
+        # Leg disagreement as a slip indicator.
         spread = 0.0
         if nst > 1:
             spread = np.sum(np.var(fv_arr, axis=0))
@@ -664,7 +652,7 @@ class IEKF_Active(Node):
 
         if nst > 0:
             Rn = self.Rn_stance.copy()
-            # cap slip penalty so high-variance frames still contribute a little
+            # Cap the slip penalty so noisy frames still contribute a little.
             penalty = min(spread * 5.0, 0.5)
             Rn[0,0] += penalty;  Rn[1,1] += penalty;  Rn[2,2] += penalty
             regime = 'stance'
@@ -674,7 +662,7 @@ class IEKF_Active(Node):
             regime = 'swing'
             z[2] = 0.0 - self._getv()[2]
 
-        # height from FK contact
+        # Height from FK contact.
         if self.is_iekf:
             z[3] = -sum_fp[2] - self._getp()[2]
             H[3,8] = 1.0
@@ -852,7 +840,7 @@ class IEKF_Active(Node):
         end_ate = float(ate[walk_end_i])
         drift = end_ate / gt_pathlen if gt_pathlen > 1e-6 else np.nan
 
-        # stats dump
+        # Console summary.
         if self.regime_hist:
             n_st  = self.regime_hist.count('stance')
             n_sw  = self.regime_hist.count('swing')
