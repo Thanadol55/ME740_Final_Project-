@@ -66,7 +66,7 @@ class IEKF_Active(Node):
         self.exp_num = str(
             self.declare_parameter('experiment_number', '01').value).strip()
 
-        # ablation config -- matches proposal Table 2
+        # config -- matches proposal Table 2
         #   baseline: VO=False Gate=False
         #   VO only:  VO=True  Gate=False
         #   proposed: VO=True  Gate=True
@@ -83,6 +83,7 @@ class IEKF_Active(Node):
         self.csv_path  = self._out_dir / f'{self.run_name}.csv'
         self.csv_summary_path = self._out_dir / f'{self.run_name}_summary.csv'
 
+        # log for debugging: to see how much the VO is gated 
         self.get_logger().info(
             '%s on SE_2(3) | VO=%s | GATE=%s | topic=%s | out=%s' %
             (self.filt_label, self.ENABLE_VO, self.ENABLE_IMPACT_GATE,
@@ -91,7 +92,7 @@ class IEKF_Active(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                           history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        # subs & pub
+        # subs and publish the value
         self.imu_sub   = self.create_subscription(Imu, '/imu/data', self._on_imu, qos)
         self.gt_sub    = self.create_subscription(Odometry, '/ground_truth/odom', self._on_gt, 10)
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self._on_joints, 10)
@@ -128,6 +129,7 @@ class IEKF_Active(Node):
         self._jnt_t = None
 
         # slip calibration -- tuned on flat-ground Isaac Sim runs
+        # This is still hand-tune, need a solid estimation 
         # lateral sway from trot was creating a steady Y drift
         self.kx = 1.0
         self.ky = 0.20    # tried 0.3 and 0.1, settled on 0.2
@@ -181,7 +183,7 @@ class IEKF_Active(Node):
         self._cur_vo     = 'vo_wait'
 
 
-    # ---- Lie group helpers ----
+    # Math Method used in RI-EKF
 
     def _skew(self, v):
         return np.array([[0, -v[2], v[1]],
@@ -220,7 +222,7 @@ class IEKF_Active(Node):
         Ad[6:9,:3] = self._skew(p) @ R;  Ad[6:9,6:9] = R
         return Ad
 
-    # state access -- just shortcuts, nothing fancy
+    # state shortcut
     def _getR(self):  return self.X[:3,:3]
     def _getv(self):  return self.X[:3, 3]
     def _getp(self):  return self.X[:3, 4]
@@ -229,7 +231,7 @@ class IEKF_Active(Node):
     def _setp(self, p): self.X[:3, 4] = p
 
 
-    # ---- Spot FK ----
+    # ---- Forward Kinematics
 
     def _get_joint(self, msg, jname):
         try:
