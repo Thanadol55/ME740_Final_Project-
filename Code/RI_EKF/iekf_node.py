@@ -231,7 +231,7 @@ class IEKF_Active(Node):
     def _setp(self, p): self.X[:3, 4] = p
 
 
-    # ---- Forward Kinematics
+    # Forward Kinematics
 
     def _get_joint(self, msg, jname):
         try:
@@ -250,8 +250,9 @@ class IEKF_Active(Node):
         return np.array([x, y, z])
 
 
-    # ---- ROS callbacks ----
+    # ROS callbacks
 
+    # gait_phase 
     def _on_phase(self, msg):
         if len(msg.data) >= 6:
             self.phi_gait['fl'] = msg.data[0]
@@ -287,6 +288,8 @@ class IEKF_Active(Node):
         self._vo_buf = (pos_vo, R_vo, tvo, impact_now, qscore, fevar)
         self._has_vo = True
 
+
+    # Joint data
     def _on_joints(self, msg):
         tnow = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
@@ -318,8 +321,10 @@ class IEKF_Active(Node):
                 self.foot_vels[leg] = (newpos - self.last_fp[leg]) / dtj
                 self.last_fp[leg] = newpos
 
+    # Ground truth -- internal tracking acting like MOCAP 
+    # Use as a baseline evaluation 
     def _on_gt(self, msg):
-        # offline ATE only, never touches filter
+        # offline ATE only
         p = msg.pose.pose.position
         self.gt_pos = np.array([p.x, p.y, p.z])
         o = msg.pose.pose.orientation
@@ -357,7 +362,7 @@ class IEKF_Active(Node):
         return True
 
 
-    # ---- prediction (see sec.IV-B in Hartley et al.) ----
+    # prediction (see sec.IV-B in Hartley et al.) 
 
     def _predict(self, w_raw, a_raw, dt):
         w = w_raw - self.bg
@@ -437,7 +442,7 @@ class IEKF_Active(Node):
         return self.ENABLE_IMPACT_GATE and self._check_touchdown()
 
 
-    # ---- VO heading fusion ----
+    # VO heading fusion 
 
     def _compute_vo_var(self, qscore, fevar, in_impact):
         qscore = float(np.clip(qscore, 0.05, 1.0))
@@ -455,7 +460,6 @@ class IEKF_Active(Node):
         self.vo_counters['consumed'] += 1
         self.vo_counters['consumed_quality_sum'] += float(np.clip(qscore, 0., 1.))
 
-        # FIXME: 0.20 threshold is pretty aggressive, maybe should be configurable
         if abs(dyaw) > 0.20:
             self._cur_vo = 'vo_reject'
             self.vo_counters['reject'] += 1
@@ -487,7 +491,7 @@ class IEKF_Active(Node):
                 (tag.upper(), z[0], np.degrees(dyaw), qscore, yvar))
 
 
-    # ---- measurement update (joseph form) ----
+    # measurement update
 
     def _kalman_update(self, z, H, Rn, t, tag):
         S = H @ self.P @ H.T + Rn
@@ -538,7 +542,7 @@ class IEKF_Active(Node):
             self.get_logger().error('NaN/Inf detected in state!')
 
 
-    # ---- main IMU loop ----
+    #  main IMU loop 
 
     def _on_imu(self, msg):
         acc = np.array([msg.linear_acceleration.x,
@@ -576,7 +580,7 @@ class IEKF_Active(Node):
         H = np.zeros((4,15))
 
         if maxspd < self.stopped_thr:
-            # ---- robot is stopped ----
+            # robot is stopped
             z[0:3] = -self._getv()
             H[0:3, 3:6] = np.eye(3)
 
@@ -605,7 +609,7 @@ class IEKF_Active(Node):
             self._publish(msg.header.stamp)
             return
 
-        # ---- stance detection via gait phase ----
+        #  stance detection via gait phase 
         self._cur_vo = 'vo_hold' if self._has_vo else 'vo_wait'
         stance = []
         if self._got_phase:
